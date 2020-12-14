@@ -19,6 +19,29 @@ def dbt(command, context):
     cmd = dbt_cmd(command, context)
     return subprocess.run(cmd, capture_output=True)
 
+def wait_dbt_rpc_state(params, context, target_state):
+"""
+    run the query specified in params until we reach target_state
+    if target_state is a function, wait until target_state(curr_state) is true
+"""
+    while True:
+        time.sleep(1)
+        try:
+            resp = requests.put(url=context.dbt_rpc_url, json=params)
+            data = resp.json()
+        except:
+            continue
+
+        state = data['result']['state']
+        if hasattr(target_state, '__call__'):
+            finished = target_state(state)
+        elif isinstance(target_state, str):
+            finished = state == target_state
+
+        if finished:
+            return data
+
+#if the rpc server is not running, start it
 def ensure_dbt_rpc(context):
     if not hasattr(context, 'dbt_rpc'):
         port = 8580
@@ -31,19 +54,13 @@ def ensure_dbt_rpc(context):
         "method": "status",
         "id": f"ensure_dbt_rpc",
     }
-    while True:
-        time.sleep(1)
-        try:
-            resp = requests.put(
-                       url=context.dbt_rpc_url,
-                       json=status_params)
-            data = resp.json()
-        except:
-            continue
-        if data['result']['state'] == "ready":
-            break
+    wait_dbt_rpc_state(status_params, context, 'ready')
 
-def wait_for_rcp_request(params, context):
+def dbt_rcp_request(params, context):
+"""
+    run a rpc query with params. It will return a request id
+    keep on checking that request until it's not in running state
+"""
     ensure_dbt_rpc(context)
     resp = requests.put(
                url=context.dbt_rpc_url,
@@ -58,16 +75,9 @@ def wait_for_rcp_request(params, context):
             "request_token": f"{request_token}"
         }
     }
-    while True:
-        time.sleep(1)
-        resp = requests.put(
-                   url=context.dbt_rpc_url,
-                   json=poll_params)
-        data = resp.json()
-        if data['result']['state'] != "running":
-            break
-    return data
-    
+    resp = wait_dbt_rpc_state(status_params, context, lambda x: x != 'running')
+    return resp
+
 def dbt_run_model(model, context):
     run_params = {
         "jsonrpc": "2.0",
@@ -77,7 +87,7 @@ def dbt_run_model(model, context):
             "models": f"{model}",
         }
     }
-    resp = wait_for_rcp_request(run_params, context)
+    resp = dbt_rcp_request(run_params, context)
 
 @given('{alias} is loaded with this data')
 def step_impl(context, alias):
