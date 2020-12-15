@@ -2,6 +2,7 @@ from behave import *
 
 from steps.utils import hash_value
 
+import json
 import os
 import re
 import sys
@@ -14,11 +15,17 @@ from hamcrest import assert_that, equal_to, is_not, contains_string
 from signal import SIGHUP
 
 class SeedUnitTest:
-    def __init__(self, context, alias, original):
-        self.alias = alias
-        self.original = original
+    def __init__(self, context, alias, hash_id, ref=None):
         self.context = context
+        self.alias = alias
+        self.hash_id = hash_id
         self.loaded = False
+        self.seed_name = f'{hash_id}_{alias}'
+        seed_path = os.path.join(
+                        context.seeds_path,
+                        f'{self.seed_name}.csv')
+        if ref:
+            self.original = f'ref("{ref}")'
 
     @property
     def original_from(self):
@@ -91,23 +98,26 @@ def ensure_dbt_rpc(context):
     if not hasattr(context, 'dbt_rpc'):
         port = 8580
         context.dbt_rpc_url = f'http://localhost:{port}/jsonrpc'
-        cmd = dbt_cmd(context, f'rpc --port {port}')
+        dbt_vars = json.dumps({s.alias: s.hash_id for s in context.seeds})
+        cmd = dbt_cmd(context, f'rpc --port {port} --vars {dbt_vars}')
         context.dbt_rpc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
         wait_dbt_rpc_state(context, 'ready')
 
 # refresh the DBT rpc with the newest seed files
 def refresh_dbt_rpc(context):
     if any(not s.loaded for s in context.seeds):
-        context.dbt_rpc.send_signal(SIGHUP)
-        wait_dbt_rpc_state(context, 'ready')
+        try:
+            context.dbt_rpc.kill()
+            time.sleep(1)
+        except AttributeError:
+            pass
+        ensure_dbt_rpc(context)
         missing_seeds = [s.alias for s in context.seeds if not s.loaded]
-        compile_run = dbt_compile(context)
         seed_load = dbt_seed(context, missing_seeds)
         # TODO: assert seed load worked
         for s in context.seeds:
             s.loaded = True
 
-    ensure_dbt_rpc(context)
 
 def dbt_rcp_request(context, method, id=None, params={}):
     """
@@ -173,20 +183,16 @@ def dbt_run(context, models=[]):
 
 @given('{alias} is loaded with this data')
 def step_impl(context, alias):
-    seed_name = f'{context.scenario_id}_{alias}'
-    seed_path = os.path.join(
-                    context.seeds_path,
-                    f'{seed_name}.csv')
-
-    with open(seed_path, 'w') as f:
+    ref_hash = context.scenario
+    seed = SeedUnitTest(context, alias, ref=ref_hash)
+    context.seeds.append(seed)
+    with open(seed.seed_path, 'w') as f:
         f.write(','.join(context.table.headings))
         f.write('\n')
         for row in context.table.rows:
             f.write(','.join(row.cells))
             f.write('\n')
 
-    context.seeds.append(
-        SeedUnitTest(context, seed_name, f'ref("{alias}")'))
 
 @when('we compile the query')
 def step_impl(context):

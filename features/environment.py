@@ -28,11 +28,11 @@ def before_all(context):
     # context.exit_mock = Mock()
     # sys.stdout = context.stdout_mock
     # sys.exit = context.exit_mock
-    ensure_dbt_rpc(context)
 
 def after_all(context):
 #     sys.stdout = context.real_stdout
-    context.dbt_rpc.kill()
+    if hasattr(context, 'dbt_rpc'):
+        context.dbt_rpc.kill()
 
 def before_scenario(context, scenario):
     feature = scenario.feature
