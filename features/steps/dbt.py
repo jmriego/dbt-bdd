@@ -12,6 +12,7 @@ import requests
 import time
 from base64 import b64encode, b64decode
 from hamcrest import assert_that, equal_to, is_not, contains_string
+from hamcrest.library.collection.issequence_containinginanyorder import contains_inanyorder
 from signal import SIGHUP
 
 
@@ -210,3 +211,11 @@ def step_impl(context):
     assert_that(
         context.compiled_sql,
         contains_string(context.text))
+
+@then('both are equal')
+def step_impl(context):
+    actuals = context.tables['calendar'].rows
+    expected = context.tables['report'].rows
+    assert_that(
+        actuals,
+        contains_inanyorder(*expected))
