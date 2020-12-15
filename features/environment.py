@@ -1,7 +1,9 @@
-import sys
-import io
 from steps.utils import hash_value
 from steps.dbt import ensure_dbt_rpc
+
+import sys
+import os
+import io
 
 BEHAVE_DEBUG_ON_ERROR = False
 DBT_UNIT_TEST_SEEDS_PATH = 'data/unit-test'
@@ -15,6 +17,10 @@ def setup_debug_on_error(userdata):
 def before_all(context):
     setup_debug_on_error(context.config.userdata)
     context.seeds_path = DBT_UNIT_TEST_SEEDS_PATH
+    try:
+        os.mkdir(context.seeds_path)
+    except FileExistsError:
+        pass
     context.target = DBT_TARGET
     context.profiles_dir = DBT_PROFILES_DIR
     # context.real_stdout = sys.stdout
@@ -41,5 +47,4 @@ def before_step(context, step):
 
 def after_step(context, step):
     if BEHAVE_DEBUG_ON_ERROR and step.status == "failed":
-        import pdb
-        pdb.post_mortem(step.exc_traceback)
+        import pdb; pdb.post_mortem(step.exc_traceback)
