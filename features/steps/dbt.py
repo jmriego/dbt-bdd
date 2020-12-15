@@ -14,6 +14,7 @@ from base64 import b64encode, b64decode
 from hamcrest import assert_that, equal_to, is_not, contains_string
 from signal import SIGHUP
 
+
 class SeedUnitTest:
     def __init__(self, context, alias, hash_id, ref=None):
         self.context = context
@@ -27,25 +28,6 @@ class SeedUnitTest:
         if ref:
             self.original = f'ref("{ref}")'
 
-    @property
-    def original_from(self):
-        try:
-            return self._original_from
-        except AttributeError:
-            self._original_from = dbt_compile_sql(
-                self.context,
-                '{{X}}'.replace('X', self.original))
-            return self._original_from
-
-    @property
-    def replaced_from(self):
-        try:
-            return self._replaced_from
-        except AttributeError:
-            self._replaced_from = dbt_compile_sql(
-                self.context,
-                '{{ref("Y")}}'.replace('Y', self.alias))
-            return self._replaced_from
 
 def dbt_cmd(context, command):
     default_flags = [
@@ -66,11 +48,10 @@ def wait_dbt_rpc_state(context, target_state, params=None):
     """
 
     if params is None:
-        id = hash_value()
         params = {
             "jsonrpc": "2.0",
             "method": "status",
-            "id": f"{id}",
+            "id": hash_value()
         }
 
     while True:
@@ -139,9 +120,9 @@ def dbt_rcp_request(context, method, id=None, params={}):
     poll_params = {
         "jsonrpc": "2.0",
         "method": "poll",
-        "id": f"{context.step_id}",
+        "id": hash_value(),
         "params": {
-            "request_token": f"{request_token}"
+            "request_token": request_token
         }
     }
     resp = wait_dbt_rpc_state(context, lambda x: x != 'running', poll_params)
@@ -197,13 +178,7 @@ def step_impl(context, alias):
 @when('we compile the query')
 def step_impl(context):
     refresh_dbt_rpc(context)
-    sql = dbt_compile_sql(context, context.text)
-    for seed in context.seeds:
-        orig = seed.original_from
-        repl = seed.replaced_from
-        # TODO: better replace method that doesnt replace partials
-        sql = sql.replace(orig, repl)
-    context.compiled_sql = sql
+    context.compiled_sql = dbt_compile_sql(context, context.text)
 
 @when('we list existing models')
 def step_impl(context):
