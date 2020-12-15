@@ -39,7 +39,7 @@ def before_scenario(context, scenario):
     context.feature_id = hash_value(feature.name)
     context.scenario_name = f'{feature.name} || {scenario.name}'
     context.scenario_id = hash_value(context.scenario_name)
-    context.seeds = {}
+    context.seeds = []
 
 def before_step(context, step):
     context.step_name = f'{context.scenario_name} || {step.name}'
