@@ -3,6 +3,7 @@ from behave import *
 from steps.utils import hash_value
 
 import os
+import re
 import sys
 import logging
 import subprocess
@@ -13,9 +14,31 @@ from hamcrest import assert_that, equal_to, is_not, contains_string
 from signal import SIGHUP
 
 class SeedUnitTest:
-    def __init__(self, alias, replaces):
+    def __init__(self, context, alias, original):
         self.alias = alias
-        self.replaces = replaces
+        self.original = original
+        self.context = context
+        self.loaded = False
+
+    @property
+    def original_from(self):
+        try:
+            return self._original_from
+        except AttributeError:
+            self._original_from = dbt_compile_sql(
+                self.context,
+                '{{X}}'.replace('X', self.original))
+            return self._original_from
+
+    @property
+    def replaced_from(self):
+        try:
+            return self._replaced_from
+        except AttributeError:
+            self._replaced_from = dbt_compile_sql(
+                self.context,
+                '{{ref("Y")}}'.replace('Y', self.alias))
+            return self._replaced_from
 
 def dbt_cmd(context, command):
     default_flags = [
@@ -74,19 +97,33 @@ def ensure_dbt_rpc(context):
 
 # refresh the DBT rpc with the newest seed files
 def refresh_dbt_rpc(context):
-    ensure_dbt_rpc(context)
-    context.dbt_rpc.send_signal(SIGHUP)
-    wait_dbt_rpc_state(context, 'ready')
+    if any(not s.loaded for s in context.seeds):
+        context.dbt_rpc.send_signal(SIGHUP)
+        wait_dbt_rpc_state(context, 'ready')
+        missing_seeds = [s.alias for s in context.seeds if not s.loaded]
+        compile_run = dbt_compile(context)
+        seed_load = dbt_seed(context, missing_seeds)
+        # TODO: assert seed load worked
+        for s in context.seeds:
+            s.loaded = True
 
-def dbt_rcp_request(context, params):
+    ensure_dbt_rpc(context)
+
+def dbt_rcp_request(context, method, id=None, params={}):
     """
     run a rpc query with params. It will return a request_id
     keep on checking that request until it's not in running state
     """
     ensure_dbt_rpc(context)
+    rpc_params = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "id": id if id else hash_value(),
+        "params": params
+    }
     resp = requests.put(
                url=context.dbt_rpc_url,
-               json=params)
+               json=rpc_params)
     request_token = resp.json()['result']['request_token']
 
     poll_params = {
@@ -100,62 +137,39 @@ def dbt_rcp_request(context, params):
     resp = wait_dbt_rpc_state(context, lambda x: x != 'running', poll_params)
     return resp
 
-def dbt_compile(context, models=[]):
-    if isinstance(models, list):
-        models = " ".join(models)
-    run_params = {
-        "jsonrpc": "2.0",
-        "method": "compile",
-        "id": f"{context.step_id}_compile",
-        "params": {
-            "models": f"{models}",
-        }
-    }
-    resp = dbt_rcp_request(context, run_params)
+def dbt_seed(context, select=[]):
+    resp = dbt_rcp_request(
+               context,
+               "seed",
+               f"{context.step_id}_seed",
+               {"select": select})
+    return resp['result']
 
-def get_seed_replacements(context):
-    refresh_dbt_rpc(context)
-    replacements = []
-    for seed in context.seeds:
-        orig = '{{X}}'.replace('X', seed.replaces)
-        repl = '{{ref("Y")}}'.replace('Y', seed.alias)
-        replacements.append(f'{orig}|{repl}')
-    sql = "\n".join(replacements)
-    compiled_sql = dbt_compile_sql(context, sql)
-    result = {}
-    for line in compiled_sql.splitlines():
-        refs = line.split('|')
-        result[refs[0]] = refs[1]
-    return result
+def dbt_compile(context, models=[]):
+    resp = dbt_rcp_request(
+               context,
+               "compile",
+               f"{context.step_id}_compile",
+               {"models": models})
+    return resp['result']
 
 def dbt_compile_sql(context, sql):
-    id = hash_value()
     sql_base64 = b64encode(sql.encode('utf-8')).decode('ascii')
-    run_params = {
-        "jsonrpc": "2.0",
-        "method": "compile_sql",
-        "id": id,
-        "params": {
-            "timeout": 60,
-            "sql": sql_base64,
-            "name": id
-        }
-    }
-    resp = dbt_rcp_request(context, run_params)
+    name = hash_value(sql_base64)
+    resp = dbt_rcp_request(
+               context,
+               "compile_sql",
+               params={"sql": sql_base64,
+                       "timeout": 60,
+                       "name": name})
     return resp['result']['results'][0]['compiled_sql']
 
 def dbt_run(context, models=[]):
-    if isinstance(models, list):
-        models = " ".join(models)
-    run_params = {
-        "jsonrpc": "2.0",
-        "method": "run",
-        "id": f"{context.step_id}_run",
-        "params": {
-            "models": f"{models}",
-        }
-    }
-    resp = dbt_rcp_request(context, run_params)
+    resp = dbt_rcp_request(
+               context,
+               "run",
+               f"{context.step_id}_compile",
+               {"models": models})
 
 @given('{alias} is loaded with this data')
 def step_impl(context, alias):
@@ -172,33 +186,37 @@ def step_impl(context, alias):
             f.write('\n')
 
     context.seeds.append(
-        SeedUnitTest(seed_name, f'ref("{alias}")'))
+        SeedUnitTest(context, seed_name, f'ref("{alias}")'))
 
 @when('we compile the query')
 def step_impl(context):
+    refresh_dbt_rpc(context)
     sql = dbt_compile_sql(context, context.text)
-    replacements = get_seed_replacements(context)
-    for orig, seed in replacements.items():
-        sql = sql.replace(orig, seed)
+    for seed in context.seeds:
+        orig = seed.original_from
+        repl = seed.replaced_from
+        # TODO: better replace method that doesnt replace partials
+        sql = sql.replace(orig, repl)
     context.compiled_sql = sql
 
 @when('we list existing models')
 def step_impl(context):
+    refresh_dbt_rpc(context)
     context.dbt = dbt(context, 'ls')
     assert True is not False
 
 @when('we run the load for {model}')
 def step_impl(context, model):
-    seed_alias = [s.alias for s in context.seed.values()]
-    seeds_string = ' '.join(seed_alias)
-    seed_load = dbt(context, f'seed --select {seeds_string}')
-    assert_that(seed_load.returncode, equal_to(0))
-    dbt_compile(context, seed_alias + [model])
+    refresh_dbt_rpc(context)
     context.dbt = dbt_run(context, model)
 
 @then("dbt didn't fail")
 def step_impl(context):
     assert context.failed is False
+
+@then("dbt failed")
+def step_impl(context):
+    assert_that(context.dbt.returncode, is_not(equal_to(0)))
 
 @then("the compiled query is")
 def step_impl(context):
@@ -206,6 +224,8 @@ def step_impl(context):
         context.compiled_sql,
         equal_to(context.text))
 
-@then("dbt failed")
+@then("the compiled query contains")
 def step_impl(context):
-    assert_that(context.dbt.returncode, is_not(equal_to(0)))
+    assert_that(
+        context.compiled_sql,
+        contains_string(context.text))

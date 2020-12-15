@@ -12,7 +12,7 @@ Feature: showing off behave
         select * from {{ref('calendar')}}
         """
       Then dbt didn't fail
-      And the compiled query is
+      And the compiled query contains
         """
-        select * from `eda-dev-coresvcs-5517`.`jvalenzuela_userdata`.`3699043a_calendar`
+        `3699043a_calendar`
         """
