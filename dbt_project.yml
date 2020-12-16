@@ -1,0 +1,39 @@
+name: 'behave'
+
+version: 2
+config-version: 2
+
+profile: 'default'
+source-paths: ["models"]
+analysis-paths: ["analysis"]
+test-paths: ["tests"]
+data-paths: ["data"]
+macro-paths: ["macros"]
+
+target-path: "target"  # directory which will store compiled SQL files
+clean-targets:         # directories to be removed by `dbt clean`
+    - "target"
+    - "dbt_modules"
+    - "data/unit-test"
+
+models:
+  behave:
+      +persist_docs:
+           relation: true
+           columns: true
+
+      # Applies to all files under models/staging/
+      staging:
+          schema: staging
+          +tags: ['staging']
+          +materialized: view
+
+seeds:
+    behave:
+        schema: userdata
+        +enabled: true
+
+snapshots:
+    behave:
+        schema: userdata
+        +enabled: true
