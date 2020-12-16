@@ -1,4 +1,5 @@
 from behave import *
+from behave.model import Table
 
 from steps.utils import hash_value
 
@@ -164,6 +165,19 @@ def dbt_compile_sql(context, sql):
                        "name": name})
     return resp['result']['results'][0]['compiled_sql']
 
+def dbt_run_sql(context, sql):
+    sql_base64 = b64encode(sql.encode('utf-8')).decode('ascii')
+    name = hash_value(sql_base64)
+    resp = dbt_rcp_request(
+               context,
+               "run_sql",
+               params={"sql": sql_base64,
+                       "timeout": 60,
+                       "name": name})
+    resp_table = resp['result']['results'][0]['table']
+    table = Table(resp_table['column_names'], rows=resp_table['rows'])
+    return table
+
 def dbt_run(context, models=[]):
     resp = dbt_rcp_request(
                context,
@@ -199,6 +213,17 @@ def step_impl(context):
         sql = sql.replace(orig, repl)
     context.compiled_sql = sql
 
+@when('we run the query')
+def step_impl(context):
+    refresh_dbt_rpc(context)
+    sql = dbt_compile_sql(context, context.text)
+    for seed in context.seeds:
+        orig = seed.original_from
+        repl = seed.replaced_from
+        # TODO: better replace method that doesnt replace partials
+        sql = sql.replace(orig, repl)
+    context.query_result = dbt_run_sql(context, sql)
+
 @when('we list existing models')
 def step_impl(context):
     refresh_dbt_rpc(context)
@@ -229,3 +254,11 @@ def step_impl(context):
     assert_that(
         context.compiled_sql,
         contains_string(context.text))
+
+@then("the results of the query are")
+def step_impl(context):
+    assert_that(
+        context.table.headings,
+        equal_to(context.query_result.headings))
+    for actual, expected in zip(context.query_result.rows, context.table.rows):
+        assert_that(actual, equal_to(expected))
