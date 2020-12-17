@@ -1,6 +1,6 @@
 from behave import *
 
-from steps.utils import hash_value
+from steps.utils import hash_value, rpc_server
 
 import json
 import os
@@ -17,17 +17,15 @@ from signal import SIGHUP
 
 
 class SeedUnitTest:
-    def __init__(self, context, alias, hash_id, ref=None):
+    def __init__(self, context, alias, hash_id):
         self.context = context
         self.alias = alias
         self.hash_id = hash_id
         self.loaded = False
         self.seed_name = f'{hash_id}_{alias}'
-        seed_path = os.path.join(
+        self.seed_path = os.path.join(
                         context.seeds_path,
                         f'{self.seed_name}.csv')
-        if ref:
-            self.original = f'ref("{ref}")'
 
 
 def dbt_cmd(context, command):
@@ -78,19 +76,17 @@ def wait_dbt_rpc_state(context, target_state, params=None):
 #if the rpc server is not running, start it
 def ensure_dbt_rpc(context):
     if not hasattr(context, 'dbt_rpc'):
-        port = 8580
-        context.dbt_rpc_url = f'http://localhost:{port}/jsonrpc'
-        dbt_vars = json.dumps({s.alias: s.hash_id for s in context.seeds})
-        cmd = dbt_cmd(context, f'rpc --port {port} --vars {dbt_vars}')
-        context.dbt_rpc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-        wait_dbt_rpc_state(context, 'ready')
+        context.dbt_rpc = rpc_server(
+            os.getcwd(),
+            cli_vars=json.dumps({s.alias: s.hash_id for s in context.seeds}),
+            profiles_dir=context.profiles_dir,
+            target=context.target)
 
 # refresh the DBT rpc with the newest seed files
 def refresh_dbt_rpc(context):
     if any(not s.loaded for s in context.seeds):
         try:
-            context.dbt_rpc.kill()
-            time.sleep(1)
+            context.dbt_rpc.exit()
         except AttributeError:
             pass
         ensure_dbt_rpc(context)
@@ -100,73 +96,26 @@ def refresh_dbt_rpc(context):
         for s in context.seeds:
             s.loaded = True
 
-
-def dbt_rcp_request(context, method, id=None, params={}):
-    """
-    run a rpc query with params. It will return a request_id
-    keep on checking that request until it's not in running state
-    """
-    ensure_dbt_rpc(context)
-    rpc_params = {
-        "jsonrpc": "2.0",
-        "method": method,
-        "id": id if id else hash_value(),
-        "params": params
-    }
-    resp = requests.put(
-               url=context.dbt_rpc_url,
-               json=rpc_params)
-    request_token = resp.json()['result']['request_token']
-
-    poll_params = {
-        "jsonrpc": "2.0",
-        "method": "poll",
-        "id": hash_value(),
-        "params": {
-            "request_token": request_token
-        }
-    }
-    resp = wait_dbt_rpc_state(context, lambda x: x != 'running', poll_params)
-    return resp
-
 def dbt_seed(context, select=[]):
-    resp = dbt_rcp_request(
-               context,
-               "seed",
-               f"{context.step_id}_seed",
-               {"select": select})
+    resp = context.dbt_rpc.seed(select)
     return resp['result']
 
 def dbt_compile(context, models=[]):
-    resp = dbt_rcp_request(
-               context,
-               "compile",
-               f"{context.step_id}_compile",
-               {"models": models})
+    resp = context.dbt_rpc.compile(models)
     return resp['result']
 
 def dbt_compile_sql(context, sql):
-    sql_base64 = b64encode(sql.encode('utf-8')).decode('ascii')
-    name = hash_value(sql_base64)
-    resp = dbt_rcp_request(
-               context,
-               "compile_sql",
-               params={"sql": sql_base64,
-                       "timeout": 60,
-                       "name": name})
+    resp = context.dbt_rpc.compile_sql(sql)
     return resp['result']['results'][0]['compiled_sql']
 
 def dbt_run(context, models=[]):
-    resp = dbt_rcp_request(
-               context,
-               "run",
-               f"{context.step_id}_compile",
-               {"models": models})
+    resp = context.dbt_rpc.run(models)
+    return resp['result']
 
 @given('{alias} is loaded with this data')
 def step_impl(context, alias):
-    ref_hash = context.scenario
-    seed = SeedUnitTest(context, alias, ref=ref_hash)
+    ref_hash = context.scenario_id
+    seed = SeedUnitTest(context, alias, ref_hash)
     context.seeds.append(seed)
     with open(seed.seed_path, 'w') as f:
         f.write(','.join(context.table.headings))
