@@ -1,7 +1,7 @@
 from behave import *
 from agate import Table
 
-from steps.utils import hash_value, behave2agate
+from steps.utils import hash_value, behave2agate, rpc_server
 
 import json
 import os
@@ -14,6 +14,7 @@ import time
 from base64 import b64encode, b64decode
 from hamcrest import assert_that, equal_to, is_not, contains_string
 from hamcrest.library.collection.issequence_containinginanyorder import contains_inanyorder
+from hamcrest.library.collection.issequence_containing import has_items
 from signal import SIGHUP
 
 
@@ -94,19 +95,17 @@ def wait_dbt_rpc_state(context, target_state, params=None):
 #if the rpc server is not running, start it
 def ensure_dbt_rpc(context):
     if not hasattr(context, 'dbt_rpc'):
-        port = 8580
-        context.dbt_rpc_url = f'http://localhost:{port}/jsonrpc'
-        cmd = dbt_cmd(context, f'rpc --port {port}')
-        context.dbt_rpc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        wait_dbt_rpc_state(context, 'ready')
+        context.dbt_rpc = rpc_server(
+            os.getcwd(),
+            cli_vars=json.dumps({s.replacement_var: s.hash_id for s in context.seeds}),
+            profiles_dir=context.profiles_dir,
+            target=context.target)
 
 # refresh the DBT rpc with the newest seed files
 def refresh_dbt_rpc(context):
     if any(not s.loaded for s in context.seeds):
         try:
-            context.dbt_rpc.terminate()
-            while context.dbt_rpc.pid:
-                time.sleep(1)
+            context.dbt_rpc.exit()
         except AttributeError:
             pass
         ensure_dbt_rpc(context)
@@ -115,74 +114,24 @@ def refresh_dbt_rpc(context):
         # TODO: assert seed load worked
         for s in context.seeds:
             s.loaded = True
-        dbt_compile(context)
-
-
-def dbt_rcp_request(context, method, id=None, params={}):
-    """
-    run a rpc query with params. It will return a request_id
-    keep on checking that request until it's not in running state
-    """
-    ensure_dbt_rpc(context)
-    rpc_params = {
-        "jsonrpc": "2.0",
-        "method": method,
-        "id": id if id else hash_value(),
-        "params": params
-    }
-    resp = requests.put(
-               url=context.dbt_rpc_url,
-               json=rpc_params)
-    request_token = resp.json()['result']['request_token']
-
-    poll_params = {
-        "jsonrpc": "2.0",
-        "method": "poll",
-        "id": hash_value(),
-        "params": {
-            "request_token": request_token
-        }
-    }
-    resp = wait_dbt_rpc_state(context, lambda x: x != 'running', poll_params)
-    return resp
 
 def dbt_seed(context, select=[]):
-    resp = dbt_rcp_request(
-               context,
-               "seed",
-               f"{context.step_id}_seed",
-               {"select": select})
+    resp = context.dbt_rpc.seed(select)
     return resp['result']
 
 def dbt_compile(context, models=[]):
-    resp = dbt_rcp_request(
-               context,
-               "compile",
-               f"{context.step_id}_compile",
-               {"models": models})
+    resp = context.dbt_rpc.compile(models)
     return resp['result']
 
 def dbt_compile_sql(context, sql):
-    sql_base64 = b64encode(sql.encode('utf-8')).decode('ascii')
-    name = hash_value(sql_base64)
-    resp = dbt_rcp_request(
-               context,
-               "compile_sql",
-               params={"sql": sql_base64,
-                       "timeout": 60,
-                       "name": name})
-    return resp['result']['results'][0]['compiled_sql']
+    resp = context.dbt_rpc.compile_sql(sql)
+    result = context.dbt_rpc.async_wait_for_result(resp)
+    return result['results'][0]['compiled_sql']
 
 def dbt_run_sql(context, sql):
-    sql_base64 = b64encode(sql.encode('utf-8')).decode('ascii')
-    name = hash_value(sql_base64)
-    resp = dbt_rcp_request(
-               context,
-               "run_sql",
-               params={"sql": sql_base64,
-                       "timeout": 60,
-                       "name": name})
-    resp_table = resp['result']['results'][0]['table']
+    resp = context.dbt_rpc.run_sql(sql)
+    result = context.dbt_rpc.async_wait_for_result(resp)
+    resp_table = result['results'][0]['table']
     column_names = resp_table['column_names']
 
     # # behave
@@ -197,19 +146,24 @@ def dbt_run_sql(context, sql):
 
 
 def dbt_run(context, models=[]):
-    resp = dbt_rcp_request(
-               context,
-               "run",
-               f"{context.step_id}_compile",
-               {"models": models})
-    assert resp['result']['state'] == 'success'
+    resp = context.dbt_rpc.run(models)
+    result = context.dbt_rpc.async_wait_for_result(resp)
+    assert result['state'] == 'success'
 
-@given('{alias} is loaded with this data')
-def step_impl(context, alias):
+@given('{alias} with {data_alias} would have')
+def step_impl(context, alias, data_alias):
+    seed = SeedUnitTest(context, alias, context.scenario_id)
+    context.seed_templates[(alias, data_alias)] = context.table
+
+@given('{alias} is loaded with {data_alias}')
+def step_impl(context, alias, data_alias):
     seed = SeedUnitTest(context, alias, context.scenario_id)
     context.seeds.append(seed)
-    seed.write_table(context.table)
-
+    if data_alias == 'this data':
+        table = context.table
+    else:
+        table = context.seed_templates[(alias, data_alias)]
+    seed.write_table(table)
 
 @when('we compile the query')
 def step_impl(context):
@@ -220,6 +174,12 @@ def step_impl(context):
 def step_impl(context):
     refresh_dbt_rpc(context)
     sql = dbt_compile_sql(context, context.text)
+    context.query_result = dbt_run_sql(context, sql)
+
+@when('we query {model}')
+def step_impl(context, model):
+    refresh_dbt_rpc(context)
+    sql = dbt_compile_sql(context, 'select * from {{ref("' + model + '")}}')
     context.query_result = dbt_run_sql(context, sql)
 
 @when('we list existing models')
@@ -254,16 +214,41 @@ def step_impl(context):
         context.compiled_sql,
         contains_string(context.text))
 
+def assert_table_equals(actuals, expected, ignore_other_columns=False):
+    if ignore_other_columns:
+        assert_that(
+            actuals.column_names,
+            has_items(*expected.column_names))
+        assert_that(
+            [r.values() for r in actuals.select(expected.column_names).rows],
+            contains_inanyorder(*[r.values() for r in expected.rows]))
+    else:
+        assert_that(
+            actuals.column_names,
+            equal_to(expected.column_names))
+        assert_that(
+            [r.values() for r in actuals.rows],
+            contains_inanyorder(*[r.values() for r in expected.rows]))
+
 @then("the results of the query are")
 def step_impl(context):
     expected = behave2agate(context.table)
     actuals = context.query_result
-    assert_that(
-        actuals.column_names,
-        equal_to(expected.column_names))
-    assert_that(
-        [r.values() for r in actuals.rows],
-        contains_inanyorder(*[r.values() for r in expected.rows]))
+    assert_table_equals(actuals, expected)
+
+@then("the results of the query ignoring other columns are")
+def step_impl(context):
+    expected = behave2agate(context.table)
+    actuals = context.query_result
+    assert_table_equals(actuals, expected, ignore_other_columns=True)
+
+@then("the results of the model ignoring other columns are")
+def step_impl(context):
+    model = context.model
+    actuals = dbt_run_sql(context, 'select * from {{ref("' + model + '")}}')
+    context.query_result = actuals
+    expected = behave2agate(context.table)
+    assert_table_equals(actuals, expected, ignore_other_columns=True)
 
 @then("the results of the model are")
 def step_impl(context):
@@ -271,9 +256,4 @@ def step_impl(context):
     actuals = dbt_run_sql(context, 'select * from {{ref("' + model + '")}}')
     context.query_result = actuals
     expected = behave2agate(context.table)
-    assert_that(
-        actuals.column_names,
-        equal_to(expected.column_names))
-    assert_that(
-        [r.values() for r in actuals.rows],
-        contains_inanyorder(*[r.values() for r in expected.rows]))
+    assert_table_equals(actuals, expected)

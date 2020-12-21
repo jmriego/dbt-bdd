@@ -31,8 +31,7 @@ def before_all(context):
 def after_scenario(context, scenario):
 # #     sys.stdout = context.real_stdout
     if hasattr(context, 'dbt_rpc'):
-        context.dbt_rpc.terminate()
-        context.dbt_rpc.communicate()
+        context.dbt_rpc.exit()
 
 def before_scenario(context, scenario):
     feature = scenario.feature
@@ -40,6 +39,7 @@ def before_scenario(context, scenario):
     context.scenario_name = f'{feature.name} || {scenario.name}'
     context.scenario_id = hash_value(context.scenario_name)
     context.seeds = []
+    context.seed_templates = {}
 
 def before_step(context, step):
     context.step_name = f'{context.scenario_name} || {step.name}'
